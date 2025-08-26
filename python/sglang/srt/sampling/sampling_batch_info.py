@@ -63,6 +63,9 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
+    # Whether to skip sample step for this batch.
+    skip_sample: bool = False
+    
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
@@ -165,6 +168,7 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            skip_sample=all(r.sampling_params.max_new_tokens == 0 for r in reqs)
         )
         return ret
 

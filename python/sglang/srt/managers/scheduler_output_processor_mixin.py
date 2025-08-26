@@ -10,6 +10,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
@@ -71,6 +72,14 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
+            # Handle prefill-only batches where sampling was skipped for optimization
+            if next_token_ids is None:
+                # For prefill-only scoring requests, create dummy token IDs
+                next_token_ids = [0] * len(batch.reqs)
+            elif batch.is_prefill_only and hasattr(next_token_ids, 'tolist'):
+                # For overlap scheduler with prefill-only, convert dummy tensor to list
+                next_token_ids = next_token_ids.tolist()
+            
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.is_retracted:
                     continue
@@ -82,9 +91,14 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
-                    req.check_finished()
+                    # For prefill-only requests (like scoring), skip adding output tokens
+                    if batch.is_prefill_only and req.sampling_params.max_new_tokens == 0:
+                        # This is a scoring request - don't add output tokens, just mark as finished
+                        req.check_finished()
+                    else:
+                        # Normal generation - add output token and check if finished
+                        req.output_ids.append(next_token_id)
+                        req.check_finished()
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -99,15 +113,52 @@ class SchedulerOutputProcessorMixin:
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_logprob_return_values(
-                            i,
-                            req,
-                            logprob_pt,
-                            next_token_ids,
-                            num_input_logprobs,
-                            logits_output,
-                        )
-                        logprob_pt += num_input_logprobs
+                        # Only process logprobs if there are input tokens to process
+                        if not batch.is_prefill_only:
+                            self.add_logprob_return_values(
+                                i,
+                                req,
+                                logprob_pt,
+                                next_token_ids,
+                                num_input_logprobs,
+                                logits_output,
+                            )
+                            logprob_pt += num_input_logprobs
+                        else:
+                            # For scoring requests, initialize input logprob fields as empty
+                            if req.input_token_logprobs_val is None:
+                                req.input_token_logprobs_val = []
+                                req.input_token_logprobs_idx = []
+                                req.input_top_logprobs_val = []
+                                req.input_top_logprobs_idx = []
+                                req.input_token_ids_logprobs_val = []
+                                req.input_token_ids_logprobs_idx = []
+
+                            # For scoring requests, add output token logprobs if available
+                            # Skip if sampling was skipped (prefill-only scoring)
+                            if logits_output.next_token_logprobs is not None:
+                                req.output_token_logprobs_val.append(
+                                    logits_output.next_token_logprobs[i]
+                                )
+                                req.output_token_logprobs_idx.append(next_token_ids[i])
+                            # For prefill-only scoring, we don't need output token logprobs
+                            # since only token_ids_logprobs are used for scoring
+
+                            # Add output token IDs logprobs if requested
+                            if (
+                                req.token_ids_logprob is not None
+                                and logits_output.next_token_token_ids_logprobs_val
+                                is not None
+                            ):
+                                # Handle delayed GPU->CPU copy for scoring requests
+                                logprobs_val = logits_output.next_token_token_ids_logprobs_val[i]
+                                if hasattr(logprobs_val, 'tolist'):
+                                    # This is a GPU tensor from delayed copy - convert now during output processing
+                                    logprobs_val = logprobs_val.tolist()
+                                req.output_token_ids_logprobs_val.append(logprobs_val)
+                                req.output_token_ids_logprobs_idx.append(
+                                    logits_output.next_token_token_ids_logprobs_idx[i]
+                                )
 
                     if (
                         req.return_hidden_states
@@ -213,7 +264,7 @@ class SchedulerOutputProcessorMixin:
             # spec decoding handles output logprobs inside verify process.
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
+                next_token_logprobs = logits_output.next_token_logprobs.tolist() if logits_output.next_token_logprobs is not None else None
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -249,19 +300,23 @@ class SchedulerOutputProcessorMixin:
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
+                if next_token_logprobs is not None:
+                    req.output_token_logprobs_val.append(next_token_logprobs[i])
+                    req.output_token_logprobs_idx.append(next_token_id)
+                if req.top_logprobs_num > 0 and logits_output.next_token_top_logprobs_val is not None:
                     req.output_top_logprobs_val.append(
                         logits_output.next_token_top_logprobs_val[i]
                     )
                     req.output_top_logprobs_idx.append(
                         logits_output.next_token_top_logprobs_idx[i]
                     )
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
+                if req.token_ids_logprob is not None and logits_output.next_token_token_ids_logprobs_val is not None:
+                    # Handle delayed GPU->CPU copy for scoring requests
+                    logprobs_val = logits_output.next_token_token_ids_logprobs_val[i]
+                    if hasattr(logprobs_val, 'tolist'):
+                        # This is a GPU tensor from delayed copy - convert now during output processing
+                        logprobs_val = logprobs_val.tolist()
+                    req.output_token_ids_logprobs_val.append(logprobs_val)
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
@@ -344,16 +399,31 @@ class SchedulerOutputProcessorMixin:
         req.input_token_logprobs.extend(input_token_logprobs)
 
         if req.top_logprobs_num > 0:
+            # Top logprobs are already CPU lists (original format)
             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
 
         if req.token_ids_logprob is not None:
-            req.temp_input_token_ids_logprobs_val.append(
-                output.input_token_ids_logprobs_val[i]
-            )
-            req.temp_input_token_ids_logprobs_idx.append(
-                output.input_token_ids_logprobs_idx[i]
-            )
+            # Token IDs logprobs are GPU tensor lists - convert to CPU lists at this point
+            if (output.input_token_ids_logprobs_val is not None 
+                and i < len(output.input_token_ids_logprobs_val) 
+                and output.input_token_ids_logprobs_val[i] is not None):
+                
+                # For overlap scheduler + prefill-only scoring, we can delay GPU->CPU copy
+                if (self.enable_overlap and 
+                    hasattr(req, 'sampling_params') and 
+                    req.sampling_params.max_new_tokens == 0 and 
+                    last_prefill_chunk):
+                    # Store GPU tensor directly for delayed conversion
+                    req.temp_input_token_ids_logprobs_val.append(output.input_token_ids_logprobs_val[i])
+                    req._scoring_gpu_tensors = True  # Mark for later conversion
+                else:
+                    # Convert GPU tensor to CPU list immediately
+                    token_ids_logprobs_val = output.input_token_ids_logprobs_val[i].tolist()
+                    req.temp_input_token_ids_logprobs_val.append(token_ids_logprobs_val)
+                    
+                token_ids_logprobs_idx = output.input_token_ids_logprobs_idx[i]
+                req.temp_input_token_ids_logprobs_idx.append(token_ids_logprobs_idx)
 
         if last_prefill_chunk:
             input_token_logprobs = req.input_token_logprobs
@@ -409,6 +479,11 @@ class SchedulerOutputProcessorMixin:
                     req.temp_input_token_ids_logprobs_idx,
                     strict=True,
                 ):
+                    # Handle delayed GPU->CPU conversion for scoring
+                    if (hasattr(req, '_scoring_gpu_tensors') and req._scoring_gpu_tensors and 
+                        hasattr(val, 'tolist')):
+                        # This is a GPU tensor that was delayed - convert now
+                        val = val.tolist()
                     req.input_token_ids_logprobs_val.extend(val)
                     req.input_token_ids_logprobs_idx.extend(idx)
 
@@ -417,6 +492,10 @@ class SchedulerOutputProcessorMixin:
                 req.input_token_ids_logprobs_idx.pop()
                 req.temp_input_token_ids_logprobs_idx = None
                 req.temp_input_token_ids_logprobs_val = None
+                
+                # Clean up the flag
+                if hasattr(req, '_scoring_gpu_tensors'):
+                    delattr(req, '_scoring_gpu_tensors')
 
             if req.return_logprob:
                 relevant_tokens_len = len(req.origin_input_ids) - req.logprob_start_len
@@ -439,21 +518,27 @@ class SchedulerOutputProcessorMixin:
         output: LogitsProcessorOutput,
     ):
         """Attach logprobs to the return values."""
-        req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[i])
+        if output.next_token_logprobs is not None:
+            req.output_token_logprobs_val.append(output.next_token_logprobs[i])
+            req.output_token_logprobs_idx.append(next_token_ids[i])
 
-        self.add_input_logprob_return_values(
-            i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
-        )
+        # Only add input logprobs if there are input tokens to process
+        if num_input_logprobs > 0:
+            self.add_input_logprob_return_values(
+                i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
+            )
 
-        if req.top_logprobs_num > 0:
+        if req.top_logprobs_num > 0 and output.next_token_top_logprobs_val is not None:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
-        if req.token_ids_logprob is not None:
-            req.output_token_ids_logprobs_val.append(
-                output.next_token_token_ids_logprobs_val[i]
-            )
+        if req.token_ids_logprob is not None and output.next_token_token_ids_logprobs_val is not None:
+            # Handle delayed GPU->CPU copy for scoring requests
+            logprobs_val = output.next_token_token_ids_logprobs_val[i]
+            if hasattr(logprobs_val, 'tolist'):
+                # This is a GPU tensor from delayed copy - convert now during output processing
+                logprobs_val = logprobs_val.tolist()
+            req.output_token_ids_logprobs_val.append(logprobs_val)
             req.output_token_ids_logprobs_idx.append(
                 output.next_token_token_ids_logprobs_idx[i]
             )

@@ -1208,11 +1208,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
-                req.extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len,
-                    req.extend_input_len,
-                    req.seqlen - 1,
-                )
+                # For scoring requests, we want to skip input logprob computation
+                # by setting extend_logprob_start_len = extend_input_len
+                if req.sampling_params.max_new_tokens == 0:
+                    req.extend_logprob_start_len = req.extend_input_len
+                else:
+                    req.extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len,
+                        req.extend_input_len,
+                        req.seqlen - 1,
+                    )
             else:
                 req.extend_logprob_start_len = 0
 

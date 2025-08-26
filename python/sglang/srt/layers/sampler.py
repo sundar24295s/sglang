@@ -152,6 +152,47 @@ class Sampler(nn.Module):
             )
 
         return batch_next_token_ids
+    
+    def compute_logprobs_only(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[List[int]],
+    ):
+        """Compute only the token_ids_logprobs without sampling, for scoring requests.
+        
+        This is used when sampling is skipped (skip_sample=True) but we still need
+        token_ids_logprobs for scoring purposes.
+        """
+        logits = logits_output.next_token_logits
+        
+        # Apply the custom logit processors if registered in the sampling info.
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(logits, sampling_info)
+        
+        if self.use_nan_detection and torch.any(torch.isnan(logits)):
+            logger.warning("Detected errors during logprob computation! NaN in the logits.")
+            logits = torch.where(
+                torch.isnan(logits), torch.full_like(logits, -1e5), logits
+            )
+            if crash_on_warnings():
+                raise ValueError("Detected errors during logprob computation! NaN in the logits.")
+        
+        # Compute logprobs for token_ids_logprobs if requested
+        if any(x is not None for x in token_ids_logprobs):
+            # Convert logits to logprobs
+            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+            
+            # Compute token_ids_logprobs (this is what scoring needs)
+            # Use delayed CPU copy for scoring requests to improve GPU-CPU overlap
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs, delay_cpu_copy=True)
+        
+        # Don't compute next_token_logprobs since we're not sampling
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
@@ -215,16 +256,56 @@ def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
     return output_top_logprobs_val, output_top_logprobs_idx
 
 
-def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
+def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]], delay_cpu_copy: bool = False):
+    batch_size = len(token_ids_logprobs)
+    output_token_ids_logprobs_val = [None] * batch_size
+    output_token_ids_logprobs_idx = [None] * batch_size
+    
+    # Collect all valid requests for vectorized batch processing
+    batch_row_indices = []
+    batch_col_indices = []
+    request_info = []  # (original_index, start_pos, num_tokens)
+    
+    current_pos = 0
     for i, token_ids in enumerate(token_ids_logprobs):
         if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
+            num_tokens = len(token_ids)
+            # Add row indices (batch dimension) - repeat for each token
+            batch_row_indices.extend([i] * num_tokens)
+            # Add column indices (token dimension)
+            batch_col_indices.extend(token_ids)
+            # Record info for splitting results back
+            request_info.append((i, current_pos, num_tokens))
+            current_pos += num_tokens
+    
+    if batch_row_indices:
+        # Single vectorized indexing operation - ONE kernel call for entire batch!
+        batch_row_tensor = torch.tensor(batch_row_indices, device=logprobs.device, dtype=torch.long)
+        batch_col_tensor = torch.tensor(batch_col_indices, device=logprobs.device, dtype=torch.long)
+        
+        # Get all logprobs in one kernel call instead of 50 separate calls!
+        batch_logprobs = logprobs[batch_row_tensor, batch_col_tensor]
+        
+        # Split results back into per-request format
+        for original_idx, start_pos, num_tokens in request_info:
+            end_pos = start_pos + num_tokens
+            request_logprobs = batch_logprobs[start_pos:end_pos]
+            
+            # Handle delayed vs immediate CPU copy
+            if delay_cpu_copy:
+                # Keep GPU tensor for later conversion during output processing
+                output_token_ids_logprobs_val[original_idx] = request_logprobs
+            else:
+                # Immediate CPU copy (original behavior)
+                output_token_ids_logprobs_val[original_idx] = request_logprobs.tolist()
+            
+            output_token_ids_logprobs_idx[original_idx] = token_ids_logprobs[original_idx]
+    
+    # Fill in empty results for None entries
+    for i in range(batch_size):
+        if output_token_ids_logprobs_val[i] is None:
+            output_token_ids_logprobs_val[i] = []
+            output_token_ids_logprobs_idx[i] = []
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 

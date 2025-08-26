@@ -174,30 +174,46 @@ class TpModelWorkerClient:
             # Run forward
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
-                    model_worker_batch, model_worker_batch.launch_done
+                    model_worker_batch, model_worker_batch.launch_done,
+                    skip_sample=model_worker_batch.sampling_info.skip_sample
                 )
             )
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
+            is_scoring_request = next_token_ids is None
+            if is_scoring_request:
+                # For prefill-only scoring, create dummy token IDs to avoid tensor assignment errors
+                # The actual values don't matter since they won't be used for scoring
+                next_token_ids = torch.zeros(bs, dtype=torch.long, device=logits_output.next_token_logits.device)
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
             ] = next_token_ids
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
-                )
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                    )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                     )
+                # Handle new GPU tensor format for top logprobs and token IDs logprobs
+                # Keep GPU tensors in the data structures - they'll be converted later
+                # in the scheduler output processor to avoid blocking the CUDA stream
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states.to(
                     "cpu", non_blocking=True
                 )
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            
+            # Avoid unnecessary GPU->CPU copy for dummy scoring tokens
+            if not is_scoring_request:
+                next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            else:
+                # For scoring requests, create CPU dummy tokens directly to avoid GPU->CPU copy
+                next_token_ids = torch.zeros(bs, dtype=torch.long)
             copy_done.record()
 
             self.output_queue.put(

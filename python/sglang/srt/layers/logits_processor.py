@@ -418,12 +418,13 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 input_token_logprobs=input_token_logprobs,
-                input_top_logprobs_val=input_top_logprobs_val,
-                input_top_logprobs_idx=input_top_logprobs_idx,
+                input_top_logprobs_val=input_top_logprobs_val,  # CPU lists (original format)
+                input_top_logprobs_idx=input_top_logprobs_idx,  # CPU lists (original format)
                 hidden_states=hidden_states_to_store,
-                input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+                input_token_ids_logprobs_val=input_token_ids_logprobs_val,  # GPU tensor lists
+                input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,  # CPU lists for indices
             )
+
 
     def _get_logits(
         self,
@@ -554,6 +555,7 @@ class LogitsProcessor(nn.Module):
     def get_token_ids_logprobs(
         all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
     ):
+        # Slice the tensors per sequence but keep on GPU
         input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
         pt = 0
         for token_ids, pruned_len in zip(
@@ -561,14 +563,14 @@ class LogitsProcessor(nn.Module):
             logits_metadata.extend_logprob_pruned_lens_cpu,
         ):
             if pruned_len <= 0:
-                input_token_ids_logprobs_val.append([])
-                input_token_ids_logprobs_idx.append([])
+                input_token_ids_logprobs_val.append(None)  # Placeholder for empty
+                input_token_ids_logprobs_idx.append(None)  # Placeholder for empty
                 continue
 
-            input_token_ids_logprobs_val.append(
-                [all_logprobs[pt + j, token_ids].tolist() for j in range(pruned_len)]
-            )
-            input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
+            # Extract logprobs for the requested token IDs, keep on GPU
+            seq_logprobs = all_logprobs[pt:pt + pruned_len, token_ids]  # Keep on GPU
+            input_token_ids_logprobs_val.append(seq_logprobs)
+            input_token_ids_logprobs_idx.append(token_ids)  # CPU list is fine for indices
             pt += pruned_len
 
         return input_token_ids_logprobs_val, input_token_ids_logprobs_idx

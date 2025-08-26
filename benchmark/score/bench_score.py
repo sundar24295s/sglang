@@ -44,13 +44,13 @@ HTTP_URL = "http://localhost:30000/v1/score"  # Use score API directly
 # ITEM_COUNT_VALUES determines number of items per score request (batch size)
 SCORE_QUERY_TOKENS = 120
 SCORE_ITEM_TOKENS = 180
-SCORE_MODEL_PATH = "Qwen/Qwen3-0.6B"
+SCORE_MODEL_PATH = "/shared/public/sharing/job-rank/kbehdin/f389cde308efd4dbb8d9-2025-06-06-18-31-30/best_model/epoch=0-step=498-HF"
 SCORE_LABEL_TOKEN_IDS = [9454, 2753]  # Yes/No token IDs
 
 # Array of RPS values to test
-RPS_VALUES = [70]
+RPS_VALUES = [120]
 # Array of duration values to test
-DURATION_SECS_VALUES = [60]  # Duration values in seconds
+DURATION_SECS_VALUES = [120]  # Duration values in seconds
 # Array of item count values to test
 ITEM_COUNT_VALUES = [10]  # Number of items per request
 # Number of unique requests to generate (will be reused)
